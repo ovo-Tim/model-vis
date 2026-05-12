@@ -1,0 +1,19 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "venv": ".venv",
+      "extraPaths": [
+        ".",
+        "./embedding_vis"
+      ]
+    }
+  ],
+  "exclude": [
+    ".venv",
+    "embedding_vis.egg-info"
+  ]
+}

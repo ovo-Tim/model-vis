@@ -1,0 +1,20 @@
+[project]
+name = "embedding-vis"
+version = "0.1.0"
+description = "Interactive embedding visualizer for transformer embeddings with UMAP and torch-backed MDS reduction"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.1.0",
+    "pandas>=2.2.3",
+    "plotly>=6.0.0",
+    "torch>=2.7.0",
+    "transformers>=4.52.0",
+    "umap-learn>=0.5.7",
+]
+
+[project.scripts]
+embedding-vis = "embedding_vis.cli:main"
+
+[tool.uv]
+package = true
