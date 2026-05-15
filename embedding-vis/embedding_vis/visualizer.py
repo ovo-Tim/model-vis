@@ -22,6 +22,7 @@ class VisualizerConfig:
     dimensions: int
     max_points: int
     token_filter_regex: str | None
+    token_include_regex: str | None
     sampling_mode: str
     extra_vectors_path: Path | None
     extra_labels_key: str
@@ -55,8 +56,8 @@ def build_visualization(config: VisualizerConfig) -> Path:
 
 
 def load_embedding_records(config: VisualizerConfig) -> list[dict[str, Any]]:
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    model = AutoModel.from_pretrained(config.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
+    model = AutoModel.from_pretrained(config.model_name, trust_remote_code=True)
     embedding_layer = model.get_input_embeddings()
     if embedding_layer is None:
         raise ValueError(
@@ -69,8 +70,21 @@ def load_embedding_records(config: VisualizerConfig) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
 
     selected_indices = select_token_ids(len(filtered_tokens), limit, config)
-    for filtered_index in selected_indices:
-        token_id, cleaned_text = filtered_tokens[filtered_index]
+    selected_tokens: list[tuple[int, str]] = [
+        filtered_tokens[filtered_index] for filtered_index in selected_indices
+    ]
+
+    include_tokens = collect_include_tokens(tokenizer, weights.shape[0], config)
+    selected_token_ids = {token_id for token_id, _ in selected_tokens}
+    forced_additions = 0
+    for token_id, cleaned_text in include_tokens:
+        if token_id in selected_token_ids:
+            continue
+        selected_tokens.append((token_id, cleaned_text))
+        selected_token_ids.add(token_id)
+        forced_additions += 1
+
+    for token_id, cleaned_text in selected_tokens:
         records.append(
             {
                 "text": cleaned_text,
@@ -83,7 +97,8 @@ def load_embedding_records(config: VisualizerConfig) -> list[dict[str, Any]]:
 
     print(
         "Final collected token number: "
-        f"{len(selected_indices)} (from {len(filtered_tokens)} regex-matched tokens)"
+        f"{len(selected_tokens)} (sampled={len(selected_indices)}, "
+        f"forced={forced_additions}, regex-matched={len(filtered_tokens)})"
     )
 
     if config.extra_vectors_path is not None:
@@ -95,7 +110,7 @@ def load_embedding_records(config: VisualizerConfig) -> list[dict[str, Any]]:
 def collect_filtered_tokens(
     tokenizer: Any, total_points: int, config: VisualizerConfig
 ) -> list[tuple[int, str]]:
-    matcher = build_token_regex_matcher(config.token_filter_regex)
+    matcher = build_regex_matcher(config.token_filter_regex, "--token-regex")
     filtered_tokens: list[tuple[int, str]] = []
     for token_id in range(total_points):
         token_text = decode_token_text(tokenizer, token_id)
@@ -106,13 +121,33 @@ def collect_filtered_tokens(
     return filtered_tokens
 
 
-def build_token_regex_matcher(pattern: str | None) -> re.Pattern[str] | None:
+def collect_include_tokens(
+    tokenizer: Any, total_points: int, config: VisualizerConfig
+) -> list[tuple[int, str]]:
+    matcher = build_regex_matcher(config.token_include_regex, "--include")
+    if matcher is None:
+        return []
+
+    include_tokens: list[tuple[int, str]] = []
+    for token_id in range(total_points):
+        token_text = decode_token_text(tokenizer, token_id)
+        cleaned_text = sanitize_token_text(token_text)
+        if matcher.search(cleaned_text):
+            include_tokens.append((token_id, cleaned_text))
+    return include_tokens
+
+
+def build_regex_matcher(
+    pattern: str | None, argument_name: str
+) -> re.Pattern[str] | None:
     if pattern is None:
         return None
     try:
         return re.compile(pattern)
     except re.error as error:
-        raise ValueError(f"Invalid --token-regex pattern: {pattern!r}. {error}") from error
+        raise ValueError(
+            f"Invalid {argument_name} pattern: {pattern!r}. {error}"
+        ) from error
 
 
 def select_token_ids(
@@ -150,7 +185,9 @@ def load_extra_vector_records(
     if config.extra_vectors_path is None:
         return []
 
-    payload = torch.load(config.extra_vectors_path, map_location=resolve_tensor_load_device(config))
+    payload = torch.load(
+        config.extra_vectors_path, map_location=resolve_tensor_load_device(config)
+    )
     vectors, texts = parse_extra_payload(payload, config)
 
     if vectors.ndim != 2:

@@ -50,6 +50,12 @@ To pre-filter tokens with a regex before reduction:
 uv run embedding-vis umap --model bert-base-uncased --token-regex "^[A-Za-z]+$" --max-points 512 --output embedding_vis_regex.html
 ```
 
+To force-include specific tokens (even if they exceed `--max-points`):
+
+```bash
+uv run embedding-vis umap --model bert-base-uncased --max-points 128 --include "^\\[CLS\\]$|^\\[SEP\\]$" --output embedding_vis_include.html
+```
+
 ## Loading extra vectors from a `.pt` file
 
 You can append extra vectors before reduction:
@@ -93,6 +99,7 @@ Filtering is entirely client-side, so it works directly from the saved HTML file
 - `--max-points`: limit how many model embedding rows are sampled
 - `--sampling-mode`: choose `top` for the first rows or `random` for a reproducible random sample using `--seed`
 - `--token-regex`: optional regex filter applied to decoded token text before sampling
+- `--include`: force-include tokens matching regex in the final collected model-token set
 - `--dimensions`: choose `2` for a planar projection or `3` for the existing 3D view
 - `--neighbors`: UMAP-only `n_neighbors`
 - `--min-dist`: UMAP-only `min_dist`

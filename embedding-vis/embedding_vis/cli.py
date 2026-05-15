@@ -90,6 +90,11 @@ def add_shared_arguments(parser: argparse.ArgumentParser) -> None:
         help="Optional regex filter applied to decoded token text before sampling and reduction.",
     )
     parser.add_argument(
+        "--include",
+        default=None,
+        help="Optional regex for tokens that must be included in the final model-token set, even beyond --max-points.",
+    )
+    parser.add_argument(
         "--sampling-mode",
         choices=("top", "random"),
         default="top",
@@ -162,6 +167,7 @@ def main() -> None:
         dimensions=args.dimensions,
         max_points=args.max_points,
         token_filter_regex=args.token_regex,
+        token_include_regex=args.include,
         sampling_mode=args.sampling_mode,
         extra_vectors_path=args.extra_vectors,
         extra_labels_key=args.extra_labels_key,
