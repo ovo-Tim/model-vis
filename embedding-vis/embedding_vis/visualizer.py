@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,12 +45,19 @@ class VisualizerConfig:
 
 def build_visualization(config: VisualizerConfig) -> Path:
     records = load_embedding_records(config)
+    if not records:
+        raise ValueError(
+            "No vectors available after token filtering. "
+            "Adjust --token-regex/--include or provide extra vectors."
+        )
     vectors = np.asarray([record["vector"] for record in records], dtype=np.float32)
     projected = reduce_embeddings(vectors, config)
     dataframe = build_dataframe(records, projected)
     figure = create_figure(dataframe, config)
+    plotted_positions = np.asarray(dataframe["position"].tolist(), dtype=np.float32)
+    neighbor_payload = build_neighbor_panel_payload(vectors, plotted_positions, config)
     config.output_path.parent.mkdir(parents=True, exist_ok=True)
-    html = build_interactive_html(figure)
+    html = build_interactive_html(figure, neighbor_payload)
     config.output_path.write_text(html, encoding="utf-8")
     print(f"Wrote interactive visualization to {config.output_path}")
     return config.output_path
@@ -313,6 +321,7 @@ def build_dataframe(
     radii = infer_point_radii(positions)
     dataframe = pd.DataFrame(
         {
+            "point_id": list(range(len(records))),
             "position": positions.tolist(),
             "text": [record["text"] for record in records],
             "label": [record["label"] for record in records],
@@ -334,13 +343,30 @@ def create_figure(dataframe: pd.DataFrame, config: VisualizerConfig) -> go.Figur
         f"<b>{label}</b><br>{source}"
         for label, source in zip(dataframe["label"], dataframe["source"])
     ]
+    point_ids = dataframe["point_id"].to_list()
     point_text = dataframe["text"].tolist()
+    point_sources = dataframe["source"].tolist()
 
     if config.dimensions == 2:
-        return create_2d_figure(positions, marker_sizes, colors, hover_text, point_text)
+        return create_2d_figure(
+            positions,
+            marker_sizes,
+            colors,
+            hover_text,
+            point_text,
+            point_sources,
+            point_ids,
+        )
 
     return create_3d_figure(
-        positions, marker_sizes, colors, hover_text, point_text, config
+        positions,
+        marker_sizes,
+        colors,
+        hover_text,
+        point_text,
+        point_sources,
+        point_ids,
+        config,
     )
 
 
@@ -350,13 +376,15 @@ def create_2d_figure(
     colors: list[str],
     hover_text: list[str],
     point_text: list[str],
+    point_sources: list[str],
+    point_ids: list[int],
 ) -> go.Figure:
     scatter = go.Scatter(
         x=positions[:, 0],
         y=positions[:, 1],
         mode="markers",
         text=point_text,
-        customdata=build_customdata(point_text, hover_text),
+        customdata=build_customdata(point_ids, point_text, point_sources),
         hovertext=hover_text,
         hovertemplate="%{hovertext}<extra></extra>",
         marker={
@@ -388,6 +416,8 @@ def create_3d_figure(
     colors: list[str],
     hover_text: list[str],
     point_text: list[str],
+    point_sources: list[str],
+    point_ids: list[int],
     config: VisualizerConfig,
 ) -> go.Figure:
     scatter = go.Scatter3d(
@@ -396,7 +426,7 @@ def create_3d_figure(
         z=positions[:, 2],
         mode="markers",
         text=point_text,
-        customdata=build_customdata(point_text, hover_text),
+        customdata=build_customdata(point_ids, point_text, point_sources),
         hovertext=hover_text,
         hovertemplate="%{hovertext}<extra></extra>",
         marker={
@@ -527,11 +557,212 @@ def build_xy_axis_config(title: str) -> dict[str, Any]:
     }
 
 
-def build_customdata(point_text: list[str], hover_text: list[str]) -> list[list[str]]:
-    return [[text, hover] for text, hover in zip(point_text, hover_text)]
+def build_customdata(
+    point_ids: list[int], point_text: list[str], point_sources: list[str]
+) -> list[list[str | int]]:
+    return [
+        [point_id, text, source]
+        for point_id, text, source in zip(point_ids, point_text, point_sources)
+    ]
 
 
-def build_interactive_html(figure: go.Figure) -> str:
+def build_neighbor_panel_payload(
+    vectors: np.ndarray, plotted_positions: np.ndarray, config: VisualizerConfig
+) -> dict[str, Any]:
+    point_count = len(vectors)
+    max_neighbors = min(100, max(point_count - 1, 0))
+    default_neighbors = min(20, max_neighbors)
+    return {
+        "default_space": "original",
+        "spaces": {
+            "original": build_neighbor_space_payload(
+                vectors,
+                label="Original Space",
+                description="Nearest neighbors in the full embedding space before reduction.",
+                metric=resolve_neighbor_metric(config.reduction_metric),
+                max_neighbors=max_neighbors,
+                default_neighbors=default_neighbors,
+                device_preference=config.device,
+            ),
+            "projected": build_neighbor_space_payload(
+                plotted_positions,
+                label="Projected Space",
+                description="Nearest neighbors in the displayed 2D/3D plot coordinates.",
+                metric="euclidean",
+                max_neighbors=max_neighbors,
+                default_neighbors=default_neighbors,
+                device_preference=config.device,
+            ),
+        },
+    }
+
+
+def build_neighbor_space_payload(
+    points: np.ndarray,
+    *,
+    label: str,
+    description: str,
+    metric: str,
+    max_neighbors: int,
+    default_neighbors: int,
+    device_preference: str,
+) -> dict[str, Any]:
+    if max_neighbors == 0 or len(points) == 0:
+        return {
+            "label": label,
+            "description": description,
+            "metric": metric,
+            "max_neighbors": 0,
+            "default_neighbors": 0,
+            "neighbors": {},
+        }
+
+    indices, distances = compute_top_neighbors(
+        points,
+        metric=metric,
+        max_neighbors=max_neighbors,
+        device_preference=device_preference,
+    )
+    neighbors = {
+        str(point_id): [
+            [int(neighbor_id), float(distance)]
+            for neighbor_id, distance in zip(point_indices, point_distances)
+        ]
+        for point_id, point_indices, point_distances in zip(
+            range(len(points)), indices, distances
+        )
+    }
+    return {
+        "label": label,
+        "description": description,
+        "metric": metric,
+        "max_neighbors": max_neighbors,
+        "default_neighbors": default_neighbors,
+        "neighbors": neighbors,
+    }
+
+
+def resolve_neighbor_metric(metric: str) -> str:
+    supported_metrics = {
+        "cosine",
+        "euclidean",
+        "l2",
+        "sqeuclidean",
+        "squared_euclidean",
+        "manhattan",
+        "cityblock",
+        "l1",
+    }
+    normalized_metric = metric.lower()
+    if normalized_metric in supported_metrics:
+        return normalized_metric
+
+    print(
+        "Nearest-points panel metric "
+        f"{metric!r} is not supported; falling back to 'cosine'."
+    )
+    return "cosine"
+
+
+def compute_top_neighbors(
+    vectors: np.ndarray,
+    *,
+    metric: str,
+    max_neighbors: int,
+    device_preference: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    device = resolve_neighbor_device(device_preference)
+    try:
+        return compute_top_neighbors_torch(vectors, metric, max_neighbors, device)
+    except (RuntimeError, NotImplementedError) as error:
+        if device_preference == "auto" and device.type != "cpu":
+            print(
+                "Falling back to CPU for the nearest-points panel because "
+                f"{device.type} failed: {error}"
+            )
+            return compute_top_neighbors_torch(
+                vectors, metric, max_neighbors, torch.device("cpu")
+            )
+        raise
+
+
+def compute_top_neighbors_torch(
+    vectors: np.ndarray,
+    metric: str,
+    max_neighbors: int,
+    device: torch.device,
+    chunk_size: int = 256,
+) -> tuple[np.ndarray, np.ndarray]:
+    points = torch.as_tensor(vectors, dtype=resolve_neighbor_dtype(device), device=device)
+    point_count = points.shape[0]
+    if point_count == 0 or max_neighbors <= 0:
+        empty = np.zeros((point_count, 0), dtype=np.int64)
+        return empty, empty.astype(np.float32)
+
+    neighbor_count = min(max_neighbors, point_count - 1)
+    all_indices: list[torch.Tensor] = []
+    all_distances: list[torch.Tensor] = []
+    normalized_metric = metric.lower()
+
+    normalized_points: torch.Tensor | None = None
+    if normalized_metric == "cosine":
+        norms = torch.linalg.norm(points, dim=1, keepdim=True).clamp_min(1e-12)
+        normalized_points = points / norms
+
+    for start in range(0, point_count, chunk_size):
+        end = min(start + chunk_size, point_count)
+        query_rows = torch.arange(end - start, device=device)
+        query_columns = torch.arange(start, end, device=device)
+
+        if normalized_metric in {"euclidean", "l2"}:
+            distances = torch.cdist(points[start:end], points, p=2.0)
+        elif normalized_metric in {"sqeuclidean", "squared_euclidean"}:
+            distances = torch.cdist(points[start:end], points, p=2.0).square()
+        elif normalized_metric in {"manhattan", "cityblock", "l1"}:
+            distances = torch.cdist(points[start:end], points, p=1.0)
+        elif normalized_metric == "cosine":
+            if normalized_points is None:
+                raise RuntimeError("Normalized points were not initialized for cosine distance.")
+            similarities = normalized_points[start:end] @ normalized_points.T
+            distances = 1.0 - similarities.clamp(-1.0, 1.0)
+        else:
+            raise ValueError(
+                "Unsupported nearest-neighbor metric: "
+                f"{metric}. Supported metrics are cosine, euclidean, sqeuclidean, manhattan, cityblock, and l1."
+            )
+
+        distances[query_rows, query_columns] = torch.inf
+        values, indices = torch.topk(
+            distances, k=neighbor_count, dim=1, largest=False
+        )
+        all_indices.append(indices.cpu())
+        all_distances.append(values.cpu())
+
+    neighbor_indices = torch.cat(all_indices, dim=0).numpy().astype(np.int64, copy=False)
+    neighbor_distances = torch.cat(all_distances, dim=0).numpy().astype(
+        np.float32, copy=False
+    )
+    return neighbor_indices, neighbor_distances
+
+
+def resolve_neighbor_device(device_preference: str) -> torch.device:
+    requested = device_preference.lower()
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(device_preference)
+
+
+def resolve_neighbor_dtype(device: torch.device) -> torch.dtype:
+    if device.type in {"cuda", "mps"}:
+        return torch.float32
+    return torch.float64
+
+
+def build_interactive_html(figure: go.Figure, neighbor_payload: dict[str, Any]) -> str:
     plot_html = figure.to_html(
         full_html=False,
         include_plotlyjs="cdn",
@@ -541,6 +772,12 @@ def build_interactive_html(figure: go.Figure) -> str:
         },
         div_id="embedding-vis-plot",
     )
+    neighbor_payload_json = serialize_json_for_script(neighbor_payload)
+    default_space = str(neighbor_payload.get("default_space", "original"))
+    default_payload = neighbor_payload["spaces"][default_space]
+    neighbor_slider_max = max(1, int(default_payload["max_neighbors"]))
+    neighbor_slider_value = max(1, int(default_payload["default_neighbors"]))
+    neighbor_slider_disabled = "disabled" if default_payload["max_neighbors"] == 0 else ""
     return f"""<!DOCTYPE html>
 <html lang=\"en\">
 <head>
@@ -567,6 +804,12 @@ def build_interactive_html(figure: go.Figure) -> str:
       flex-direction: column;
       height: 100vh;
       overflow: hidden;
+    }}
+    #content-shell {{
+      flex: 1;
+      min-height: 0;
+      min-width: 0;
+      display: flex;
     }}
     .toolbar {{
       display: flex;
@@ -653,6 +896,196 @@ def build_interactive_html(figure: go.Figure) -> str:
       width: 100%;
       height: 100% !important;
     }}
+    #nearest-panel {{
+      width: 360px;
+      flex: 0 0 360px;
+      min-width: 300px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      padding: 18px;
+      border-left: 1px solid rgba(148, 163, 184, 0.18);
+      background: #0f172a;
+      overflow-y: auto;
+    }}
+    .panel-kicker {{
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #60a5fa;
+      margin-bottom: 6px;
+    }}
+    .panel-title {{
+      margin: 0;
+      font-size: 28px;
+      line-height: 1.1;
+    }}
+    .panel-caption {{
+      margin: 8px 0 0;
+      color: #94a3b8;
+      font-size: 14px;
+      line-height: 1.45;
+    }}
+    .neighbor-controls {{
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 14px;
+      border-radius: 14px;
+      background: rgba(30, 41, 59, 0.55);
+      border: 1px solid rgba(148, 163, 184, 0.12);
+    }}
+    .neighbor-controls-header {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 14px;
+      color: #cbd5e1;
+    }}
+    .metric-badge {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: #94a3b8;
+    }}
+    .metric-badge strong {{
+      color: #f8fafc;
+      font-size: 12px;
+      letter-spacing: 0.05em;
+    }}
+    .space-toggle {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }}
+    .space-toggle button {{
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      border-radius: 10px;
+      background: rgba(15, 23, 42, 0.65);
+      color: #cbd5e1;
+      padding: 10px 12px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+    }}
+    .space-toggle button.is-active {{
+      background: rgba(37, 99, 235, 0.18);
+      border-color: rgba(96, 165, 250, 0.65);
+      color: #eff6ff;
+    }}
+    #nearest-neighbor-count {{
+      width: 100%;
+      accent-color: #2563eb;
+    }}
+    #nearest-selected {{
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 14px;
+      border-radius: 14px;
+      background: rgba(30, 41, 59, 0.55);
+      border: 1px solid rgba(148, 163, 184, 0.12);
+    }}
+    .selected-token {{
+      font-size: 24px;
+      font-weight: 700;
+      word-break: break-word;
+    }}
+    .selected-source {{
+      font-size: 13px;
+      color: #94a3b8;
+      word-break: break-word;
+    }}
+    .selected-empty {{
+      color: #94a3b8;
+      font-size: 14px;
+      line-height: 1.45;
+    }}
+    #nearest-list {{
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }}
+    .neighbor-row {{
+      border: 0;
+      width: 100%;
+      padding: 0;
+      background: transparent;
+      color: inherit;
+      text-align: left;
+      cursor: pointer;
+    }}
+    .neighbor-row-head {{
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 4px;
+    }}
+    .neighbor-name {{
+      font-size: 16px;
+      color: #f8fafc;
+      word-break: break-word;
+    }}
+    .neighbor-distance {{
+      flex: 0 0 auto;
+      font-variant-numeric: tabular-nums;
+      color: #cbd5e1;
+    }}
+    .neighbor-source {{
+      margin-bottom: 6px;
+      font-size: 12px;
+      color: #94a3b8;
+      word-break: break-word;
+    }}
+    .neighbor-bar {{
+      height: 3px;
+      width: 100%;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(148, 163, 184, 0.16);
+    }}
+    .neighbor-bar-fill {{
+      height: 100%;
+      border-radius: inherit;
+    }}
+    .neighbor-rank {{
+      color: #64748b;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      margin-bottom: 4px;
+    }}
+    .neighbor-bar-caption {{
+      margin-top: 4px;
+      font-size: 11px;
+      color: #64748b;
+    }}
+    .nearest-empty {{
+      color: #94a3b8;
+      font-size: 14px;
+      line-height: 1.45;
+      padding: 6px 0;
+    }}
+    @media (max-width: 1100px) {{
+      .app-shell {{
+        height: auto;
+        min-height: 100vh;
+        overflow: auto;
+      }}
+      #content-shell {{
+        flex-direction: column;
+      }}
+      #nearest-panel {{
+        width: auto;
+        min-width: 0;
+        border-left: 0;
+        border-top: 1px solid rgba(148, 163, 184, 0.18);
+      }}
+      #plot-container {{
+        min-height: 55vh;
+      }}
+    }}
   </style>
 </head>
 <body>
@@ -672,18 +1105,56 @@ def build_interactive_html(figure: go.Figure) -> str:
         <div id=\"token-filter-error\" class=\"status-error\"></div>
       </div>
     </div>
-    <div id=\"plot-container\">{plot_html}</div>
+    <div id=\"content-shell\">
+      <div id=\"plot-container\">{plot_html}</div>
+      <aside id=\"nearest-panel\">
+        <div>
+          <div class=\"panel-kicker\" id=\"nearest-space-kicker\">{default_payload["label"]}</div>
+          <h2 class=\"panel-title\">Nearest Points</h2>
+          <p class=\"panel-caption\" id=\"nearest-space-caption\">{default_payload["description"]}</p>
+        </div>
+        <div class=\"neighbor-controls\">
+          <div class=\"space-toggle\">
+            <button id=\"neighbor-space-original\" type=\"button\" data-space=\"original\" class=\"is-active\">Original</button>
+            <button id=\"neighbor-space-projected\" type=\"button\" data-space=\"projected\">Projected</button>
+          </div>
+          <div class=\"neighbor-controls-header\">
+            <span>Neighbors</span>
+            <strong id=\"nearest-neighbor-count-value\">{neighbor_slider_value}</strong>
+          </div>
+          <input id=\"nearest-neighbor-count\" type=\"range\" min=\"1\" max=\"{neighbor_slider_max}\" value=\"{neighbor_slider_value}\" {neighbor_slider_disabled}>
+          <div class=\"metric-badge\">Metric <strong id=\"nearest-metric-label\"></strong></div>
+        </div>
+        <div id=\"nearest-selected\">
+          <div class=\"selected-empty\">Click a point in the plot to populate this panel.</div>
+        </div>
+        <div id=\"nearest-list\">
+          <div class=\"nearest-empty\">Nearest points in {default_payload["label"].lower()} will appear here.</div>
+        </div>
+      </aside>
+    </div>
   </div>
   <script>
     (() => {{
+      const neighborPayload = {neighbor_payload_json};
       const graphDiv = document.getElementById('embedding-vis-plot');
       const queryInput = document.getElementById('token-filter-query');
       const regexInput = document.getElementById('token-filter-regex');
       const clearButton = document.getElementById('token-filter-clear');
       const countLabel = document.getElementById('token-filter-count');
       const errorLabel = document.getElementById('token-filter-error');
+      const nearestCountInput = document.getElementById('nearest-neighbor-count');
+      const nearestCountValue = document.getElementById('nearest-neighbor-count-value');
+      const nearestMetricLabel = document.getElementById('nearest-metric-label');
+      const nearestSpaceKicker = document.getElementById('nearest-space-kicker');
+      const nearestSpaceCaption = document.getElementById('nearest-space-caption');
+      const nearestSelected = document.getElementById('nearest-selected');
+      const nearestList = document.getElementById('nearest-list');
+      const spaceButtons = Array.from(document.querySelectorAll('.space-toggle button'));
+      let selectedPointId = null;
+      let activeNeighborSpace = String(neighborPayload.default_space || 'original');
 
-      const originalData = graphDiv.data.map((trace) => {{
+      const baseData = graphDiv.data.map((trace) => {{
         const copyArray = (value) => Array.isArray(value) ? value.slice() : value;
         const marker = trace.marker || {{}};
         return {{
@@ -704,8 +1175,204 @@ def build_interactive_html(figure: go.Figure) -> str:
           hovertemplate: trace.hovertemplate,
         }};
       }});
+      const is3d = baseData.some((trace) => trace.type === 'scatter3d');
 
-      const totalPoints = originalData.reduce((sum, trace) => sum + (trace.text ? trace.text.length : 0), 0);
+      const pointMetadata = new Map();
+      for (const trace of baseData) {{
+        for (const item of trace.customdata || []) {{
+          if (!item || item.length < 3) {{
+            continue;
+          }}
+          pointMetadata.set(String(item[0]), {{
+            text: String(item[1] || ''),
+            source: String(item[2] || ''),
+          }});
+        }}
+      }}
+
+      const totalPoints = baseData.reduce((sum, trace) => sum + (trace.text ? trace.text.length : 0), 0);
+
+      function createLineTrace() {{
+        if (is3d) {{
+          return {{
+            type: 'scatter3d',
+            mode: 'lines',
+            x: [],
+            y: [],
+            z: [],
+            hoverinfo: 'skip',
+            showlegend: false,
+            line: {{ width: 2, color: 'rgba(96, 165, 250, 0.55)' }},
+          }};
+        }}
+        return {{
+          type: 'scatter',
+          mode: 'lines',
+          x: [],
+          y: [],
+          hoverinfo: 'skip',
+          showlegend: false,
+          line: {{ width: 2, color: 'rgba(96, 165, 250, 0.55)' }},
+        }};
+      }}
+
+      function createHighlightTrace() {{
+        if (is3d) {{
+          return {{
+            type: 'scatter3d',
+            mode: 'markers',
+            x: [],
+            y: [],
+            z: [],
+            hoverinfo: 'skip',
+            showlegend: false,
+            marker: {{ size: [], color: [], opacity: 1, line: {{ width: 0 }} }},
+          }};
+        }}
+        return {{
+          type: 'scatter',
+          mode: 'markers',
+          x: [],
+          y: [],
+          hoverinfo: 'skip',
+          showlegend: false,
+          marker: {{ size: [], color: [], opacity: 1, line: {{ width: 0 }} }},
+        }};
+      }}
+
+      function getSpacePayload() {{
+        return neighborPayload.spaces[activeNeighborSpace] || neighborPayload.spaces.original;
+      }}
+
+      function syncSpaceControls() {{
+        const payload = getSpacePayload();
+        nearestSpaceKicker.textContent = String(payload.label || activeNeighborSpace);
+        nearestSpaceCaption.textContent = String(payload.description || '');
+        nearestMetricLabel.textContent = String(payload.metric || '').toUpperCase();
+
+        const maxNeighbors = Number(payload.max_neighbors || 0);
+        nearestCountInput.max = String(Math.max(1, maxNeighbors));
+        nearestCountInput.disabled = maxNeighbors === 0;
+
+        if (maxNeighbors === 0) {{
+          nearestCountInput.value = '1';
+          nearestCountValue.textContent = '0';
+        }} else {{
+          const nextValue = Math.min(
+            Number(nearestCountInput.value || payload.default_neighbors || 1),
+            maxNeighbors,
+          );
+          nearestCountInput.value = String(Math.max(1, nextValue));
+          nearestCountValue.textContent = nearestCountInput.value;
+        }}
+
+        for (const button of spaceButtons) {{
+          button.classList.toggle('is-active', button.dataset.space === activeNeighborSpace);
+        }}
+      }}
+
+      function pointFromTrace(trace, index) {{
+        if (!trace.customdata || !trace.customdata[index]) {{
+          return null;
+        }}
+        return {{
+          pointId: String(trace.customdata[index][0]),
+          x: trace.x ? Number(trace.x[index]) : null,
+          y: trace.y ? Number(trace.y[index]) : null,
+          z: trace.z ? Number(trace.z[index]) : null,
+        }};
+      }}
+
+      function buildVisiblePointMap(traces) {{
+        const visiblePoints = new Map();
+        for (const trace of traces) {{
+          for (let index = 0; index < (trace.customdata || []).length; index += 1) {{
+            const point = pointFromTrace(trace, index);
+            if (point) {{
+              visiblePoints.set(point.pointId, point);
+            }}
+          }}
+        }}
+        return visiblePoints;
+      }}
+
+      function getVisibleNeighborEntries(visiblePointMap) {{
+        if (selectedPointId === null) {{
+          return [];
+        }}
+
+        const payload = getSpacePayload();
+        const allNeighbors = payload.neighbors[String(selectedPointId)] || [];
+        const targetCount = Number(nearestCountInput.value || 0);
+        const visibleNeighbors = [];
+
+        for (const entry of allNeighbors) {{
+          const pointId = String(entry[0]);
+          const point = visiblePointMap.get(pointId);
+          if (!point) {{
+            continue;
+          }}
+          visibleNeighbors.push({{
+            pointId,
+            distance: Number(entry[1]),
+            point,
+          }});
+          if (visibleNeighbors.length >= targetCount) {{
+            break;
+          }}
+        }}
+
+        return visibleNeighbors;
+      }}
+
+      function buildOverlayTraces(filteredBase) {{
+        const visiblePointMap = buildVisiblePointMap(filteredBase);
+        if (selectedPointId !== null && !visiblePointMap.has(String(selectedPointId))) {{
+          selectedPointId = null;
+        }}
+
+        const lineTrace = createLineTrace();
+        const highlightTrace = createHighlightTrace();
+        if (selectedPointId === null) {{
+          return {{ lineTrace, highlightTrace, visiblePointMap }};
+        }}
+
+        const selectedPoint = visiblePointMap.get(String(selectedPointId));
+        if (!selectedPoint) {{
+          return {{ lineTrace, highlightTrace, visiblePointMap }};
+        }}
+
+        const visibleNeighbors = getVisibleNeighborEntries(visiblePointMap);
+        const selectedColor = '#f59e0b';
+        const neighborColor = '#60a5fa';
+
+        highlightTrace.x.push(selectedPoint.x);
+        highlightTrace.y.push(selectedPoint.y);
+        if (is3d) {{
+          highlightTrace.z.push(selectedPoint.z);
+        }}
+        highlightTrace.marker.size.push(16);
+        highlightTrace.marker.color.push(selectedColor);
+
+        for (const entry of visibleNeighbors) {{
+          const point = entry.point;
+          lineTrace.x.push(selectedPoint.x, point.x, null);
+          lineTrace.y.push(selectedPoint.y, point.y, null);
+          if (is3d) {{
+            lineTrace.z.push(selectedPoint.z, point.z, null);
+          }}
+
+          highlightTrace.x.push(point.x);
+          highlightTrace.y.push(point.y);
+          if (is3d) {{
+            highlightTrace.z.push(point.z);
+          }}
+          highlightTrace.marker.size.push(11);
+          highlightTrace.marker.color.push(neighborColor);
+        }}
+
+        return {{ lineTrace, highlightTrace, visiblePointMap }};
+      }}
 
       function updateStatus(visibleCount) {{
         if (!queryInput.value) {{
@@ -734,6 +1401,71 @@ def build_interactive_html(figure: go.Figure) -> str:
         const normalizedQuery = query.toLowerCase();
         errorLabel.textContent = '';
         return (value) => value.toLowerCase().includes(normalizedQuery);
+      }}
+
+      function escapeHtml(value) {{
+        return String(value).replace(/[&<>\"']/g, (character) => ({{
+          '&': '&amp;',
+          '<': '&lt;',
+          '>': '&gt;',
+          '"': '&quot;',
+          "'": '&#39;',
+        }})[character]);
+      }}
+
+      function formatDistance(distance) {{
+        return Number.isFinite(distance) ? distance.toFixed(3) : 'n/a';
+      }}
+
+      function renderNearestPanel(visiblePointMap) {{
+        syncSpaceControls();
+        const payload = getSpacePayload();
+        if (selectedPointId === null) {{
+          nearestSelected.innerHTML = '<div class="selected-empty">Click a point in the plot to populate this panel.</div>';
+          nearestList.innerHTML = `<div class="nearest-empty">Nearest points in ${{escapeHtml(payload.label || activeNeighborSpace)}} will appear here.</div>`;
+          return;
+        }}
+
+        const selectedMetadata = pointMetadata.get(String(selectedPointId));
+        if (!selectedMetadata || !visiblePointMap.has(String(selectedPointId))) {{
+          nearestSelected.innerHTML = '<div class="selected-empty">The selected point is no longer available.</div>';
+          nearestList.innerHTML = '<div class="nearest-empty">No neighbor data available for the selected point.</div>';
+          return;
+        }}
+
+        nearestSelected.innerHTML = `
+          <div class="selected-token">${{escapeHtml(selectedMetadata.text)}}</div>
+          <div class="selected-source">${{escapeHtml(selectedMetadata.source)}}</div>
+        `;
+
+        const visibleNeighbors = getVisibleNeighborEntries(visiblePointMap);
+        if (!visibleNeighbors.length) {{
+          nearestList.innerHTML = '<div class="nearest-empty">No visible nearest neighbors remain for this point under the current filter.</div>';
+          return;
+        }}
+
+        const maxDistance = Math.max(...visibleNeighbors.map((entry) => Number(entry.distance) || 0), 1e-6);
+        nearestList.innerHTML = visibleNeighbors.map((entry, index) => {{
+          const neighborId = String(entry.pointId);
+          const distance = Number(entry.distance);
+          const neighborMetadata = pointMetadata.get(neighborId) || {{ text: `#${{neighborId}}`, source: '' }};
+          const width = Math.max(8, (1 - distance / maxDistance) * 100);
+          const hue = 350 - Math.round((index / Math.max(visibleNeighbors.length - 1, 1)) * 140);
+          return `
+            <button class="neighbor-row" type="button" data-point-id="${{escapeHtml(neighborId)}}">
+              <div class="neighbor-row-head">
+                <span class="neighbor-name">${{escapeHtml(neighborMetadata.text)}}</span>
+                <span class="neighbor-distance">${{formatDistance(distance)}}</span>
+              </div>
+              <div class="neighbor-rank">Rank #${{index + 1}}</div>
+              <div class="neighbor-source">${{escapeHtml(neighborMetadata.source)}}</div>
+              <div class="neighbor-bar">
+                <div class="neighbor-bar-fill" style="width: ${{width.toFixed(1)}}%; background: hsl(${{hue}}deg 86% 61%);"></div>
+              </div>
+              <div class="neighbor-bar-caption">Bar = relative closeness within the current visible list. Number = actual distance.</div>
+            </button>
+          `;
+        }}).join('');
       }}
 
       function filterTrace(trace, matcher) {{
@@ -778,14 +1510,40 @@ def build_interactive_html(figure: go.Figure) -> str:
         if (matcher === false) {{
           return;
         }}
-        const filteredData = originalData.map((trace) => filterTrace(trace, matcher));
-        const visibleCount = filteredData.reduce((sum, trace) => sum + (trace.text ? trace.text.length : 0), 0);
-        Plotly.react(graphDiv, filteredData, graphDiv.layout, graphDiv._context);
+        const filteredBase = baseData.map((trace) => filterTrace(trace, matcher));
+        const visibleCount = filteredBase.reduce((sum, trace) => sum + (trace.text ? trace.text.length : 0), 0);
+        const overlays = buildOverlayTraces(filteredBase);
+        const plotData = filteredBase.concat([overlays.lineTrace, overlays.highlightTrace]);
+        Plotly.react(graphDiv, plotData, graphDiv.layout, graphDiv._context);
+        renderNearestPanel(overlays.visiblePointMap);
         updateStatus(visibleCount);
       }}
 
       queryInput.addEventListener('input', applyFilter);
       regexInput.addEventListener('change', applyFilter);
+      nearestCountInput.addEventListener('input', applyFilter);
+      for (const button of spaceButtons) {{
+        button.addEventListener('click', () => {{
+          activeNeighborSpace = String(button.dataset.space || 'original');
+          applyFilter();
+        }});
+      }}
+      nearestList.addEventListener('click', (event) => {{
+        const row = event.target.closest('.neighbor-row');
+        if (!row) {{
+          return;
+        }}
+        selectedPointId = String(row.dataset.pointId);
+        applyFilter();
+      }});
+      graphDiv.on('plotly_click', (event) => {{
+        const point = event.points && event.points[0];
+        if (!point || !point.customdata || point.customdata.length === 0) {{
+          return;
+        }}
+        selectedPointId = String(point.customdata[0]);
+        applyFilter();
+      }});
       clearButton.addEventListener('click', () => {{
         queryInput.value = '';
         regexInput.checked = false;
@@ -793,9 +1551,20 @@ def build_interactive_html(figure: go.Figure) -> str:
         applyFilter();
       }});
 
+      syncSpaceControls();
+      applyFilter();
       updateStatus(totalPoints);
     }})();
   </script>
 </body>
 </html>
 """
+
+
+def serialize_json_for_script(payload: Any) -> str:
+    return (
+        json.dumps(payload)
+        .replace("</", "<\\/")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )

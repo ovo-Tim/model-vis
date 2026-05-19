@@ -90,6 +90,8 @@ The exported page also includes:
 - a live search bar for tokens and labels
 - an optional regex mode toggle for pattern-based filtering
 - a clear button and a live match counter
+- a nearest-points side panel with an original-space/projected-space toggle
+- selected-point and nearest-neighbor highlights with connecting lines drawn in the plot
 
 Filtering is entirely client-side, so it works directly from the saved HTML file.
 
