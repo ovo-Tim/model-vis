@@ -72,7 +72,7 @@ def get_attention(tokenizer, model, prompt, max_new_tokens=20):
     ]
     attentions = []
     for layer_attn in outputs.attentions:
-        summed = layer_attn[0].sum(dim=0).cpu().numpy()
+        summed = layer_attn[0].sum(dim=0).to(torch.float32).cpu().numpy()
         attentions.append(summed)
 
     # Debug: attention statistics
@@ -158,17 +158,34 @@ function computeZ() {{
 
 computeZ();
 
+var tickText = {tokens_json};
+var tickVals = tickText.map(function(_, i) {{ return i; }});
+
+var hoverTexts = [];
+for (var i = 0; i < numLayers; i++) {{
+    var layerText = [];
+    for (var r = 0; r < tickText.length; r++) {{
+        var rowText = [];
+        for (var c = 0; c < tickText.length; c++) {{
+            rowText.push("From: " + tickText[r] + "<br>To: " + tickText[c] + "<br>Score: " + curZ[i][r][c].toFixed(4));
+        }}
+        layerText.push(rowText);
+    }}
+    hoverTexts.push(layerText);
+}}
+
 var figData = [];
 for (var i = 0; i < numLayers; i++) {{
     figData.push({{
         type: "heatmap",
         z: curZ[i],
-        x: {tokens_json},
-        y: {tokens_json},
+        x: tickVals,
+        y: tickVals,
+        text: hoverTexts[i],
         colorscale: [[0, '#ffffff'], [1, '#08306b']],
         visible: i === 0,
         name: "Layer " + i,
-        hovertemplate: "From: %{{y}}<br>To: %{{x}}<br>Score: %{{z:.4f}}<extra></extra>",
+        hovertemplate: "%{{text}}<extra></extra>",
         colorbar: {{title: {{text: "Score", side: "right"}}, thickness: 15, len: 0.8}}
     }});
 }}
@@ -176,8 +193,24 @@ for (var i = 0; i < numLayers; i++) {{
 var figLayout = {{
     autosize: true,
     title: {{text: "Layer 0 / " + (numLayers - 1) + " — " + model + " (heads summed)", font: {{size: 16}}, x: 0.5, xanchor: "center"}},
-    xaxis: {{title: "Key (attended to)", side: "bottom", tickangle: -45, automargin: true}},
-    yaxis: {{title: "Query (attending from)", autorange: "reversed", automargin: false, tickfont: {{size: 10}}}},
+    xaxis: {{
+        title: "Key (attended to)",
+        side: "bottom",
+        tickangle: -45,
+        automargin: true,
+        tickmode: "array",
+        tickvals: tickVals,
+        ticktext: tickText
+    }},
+    yaxis: {{
+        title: "Query (attending from)",
+        autorange: "reversed",
+        automargin: false,
+        tickfont: {{size: 10}},
+        tickmode: "array",
+        tickvals: tickVals,
+        ticktext: tickText
+    }},
     margin: {{l: 120, r: 80, t: 80, b: 140}}
 }};
 
@@ -188,14 +221,27 @@ getTitle = function() {{
     return "Layer " + current + " / " + (numLayers - 1) + " — " + model + " (heads summed" + (logScale ? ", log" + logBase : "") + ")";
 }};
 
+function rebuildHoverTexts() {{
+    for (var i = 0; i < numLayers; i++) {{
+        for (var r = 0; r < tickText.length; r++) {{
+            for (var c = 0; c < tickText.length; c++) {{
+                hoverTexts[i][r][c] = "From: " + tickText[r] + "<br>To: " + tickText[c] + "<br>Score: " + curZ[i][r][c].toFixed(4);
+            }}
+        }}
+    }}
+}}
+
 function refreshChart() {{
+    rebuildHoverTexts();
     var vis = [];
     var zs = [];
+    var texts = [];
     for (var i = 0; i < numLayers; i++) {{
         vis.push(i === current);
         zs.push(curZ[i]);
+        texts.push(hoverTexts[i]);
     }}
-    Plotly.restyle("chart", {{"visible": vis, "z": zs}});
+    Plotly.restyle("chart", {{"visible": vis, "z": zs, "text": texts}});
     Plotly.relayout("chart", {{title: {{text: getTitle(), font: {{size: 16}}, x: 0.5, xanchor: "center"}}}});
 }}
 
