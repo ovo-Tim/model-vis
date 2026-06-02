@@ -8,18 +8,36 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
-def load_model(model_name):
+def load_model(model_name, device=None):
     print(f"Loading model: {model_name} ...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+    if device == "cpu":
+        dtype = torch.float32
+        device_map = None
+    elif device == "cuda" or (device is None and torch.cuda.is_available()):
+        dtype = torch.float16
+        device_map = "auto"
+    elif device == "mps" or (device is None and torch.backends.mps.is_available()):
+        dtype = torch.float16
+        device_map = None
+    else:
+        dtype = torch.float32
+        device_map = None
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         trust_remote_code=True,
-        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
+        dtype=dtype,
+        device_map=device_map,
         attn_implementation="eager",
     )
+    if device:
+        model = model.to(device)
+    elif device_map is None and torch.backends.mps.is_available():
+        model = model.to("mps")
     model.eval()
-    print(f"Model loaded. Layers: {model.config.num_hidden_layers}")
+    print(f"Model loaded. Device: {model.device}, Layers: {model.config.num_hidden_layers}")
     return tokenizer, model
 
 
@@ -30,13 +48,23 @@ def clean_token(tokenizer, token):
     return html.escape(text)
 
 
-def get_attention(tokenizer, model, prompt):
+def get_attention(tokenizer, model, prompt, max_new_tokens=20):
     print(f"Running inference on: {prompt!r}")
     inputs = tokenizer(prompt, return_tensors="pt")
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
     with torch.no_grad():
         outputs = model(**inputs, output_attentions=True)
+
+        # Generate continuation to verify model works (no cache to avoid Phi-3.5 compat issues)
+        gen_outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=False,
+        )
+        generated = tokenizer.decode(gen_outputs[0], skip_special_tokens=True)
+        print(f"Generated ({max_new_tokens} tokens): {generated!r}")
 
     tokens = [
         clean_token(tokenizer, t)
@@ -47,8 +75,17 @@ def get_attention(tokenizer, model, prompt):
         summed = layer_attn[0].sum(dim=0).cpu().numpy()
         attentions.append(summed)
 
-    print(f"Tokens ({len(tokens)}): {tokens}")
+    # Debug: attention statistics
+    print(f"\nTokens ({len(tokens)}): {tokens}")
     print(f"Layers: {len(attentions)}")
+    print("\nAttention stats per layer (summed over heads):")
+    all_vals = []
+    for i, attn in enumerate(attentions):
+        flat = attn.flatten()
+        all_vals.extend(flat.tolist())
+        print(f"  Layer {i:2d}: min={flat.min():.4f}, max={flat.max():.4f}, mean={flat.mean():.4f}, std={flat.std():.4f}")
+    all_arr = torch.tensor(all_vals)
+    print(f"\nGlobal: min={all_arr.min():.4f}, max={all_arr.max():.4f}, mean={all_arr.mean():.4f}, std={all_arr.std():.4f}")
     return tokens, attentions
 
 
@@ -207,14 +244,28 @@ window.addEventListener("resize", function() {{ Plotly.Plots.resize("chart"); }}
 
 def main():
     parser = argparse.ArgumentParser(description="Attention Score Visualization")
-    parser.add_argument("--model", default="openbmb/MiniCPM5-1B", help="HuggingFace model name")
-    parser.add_argument("--prompt", default="The quick brown fox jumps over the lazy dog.", help="Input prompt")
+    parser.add_argument(
+        "--model", default="openbmb/MiniCPM5-1B", help="HuggingFace model name"
+    )
+    parser.add_argument(
+        "--prompt",
+        default="The quick brown fox jumps over the lazy dog.",
+        help="Input prompt",
+    )
     parser.add_argument("--output", default="attention.html", help="Output HTML file")
-    parser.add_argument("--no-browser", action="store_true", help="Do not open browser automatically")
+    parser.add_argument(
+        "--no-browser", action="store_true", help="Do not open browser automatically"
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=20, help="Max tokens to generate for prediction check"
+    )
+    parser.add_argument(
+        "--device", default=None, choices=["cpu", "cuda", "mps"], help="Force device (default: auto)"
+    )
     args = parser.parse_args()
 
-    tokenizer, model = load_model(args.model)
-    tokens, attentions = get_attention(tokenizer, model, args.prompt)
+    tokenizer, model = load_model(args.model, device=args.device)
+    tokens, attentions = get_attention(tokenizer, model, args.prompt, max_new_tokens=args.max_tokens)
 
     num_layers = len(attentions)
     raw_z = [a.tolist() for a in attentions]
