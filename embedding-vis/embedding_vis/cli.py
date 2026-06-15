@@ -55,6 +55,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=1e-7,
         help="Early-stop tolerance on stress improvement between iterations.",
     )
+    mds_parser.add_argument(
+        "--mds-extra-weight",
+        type=float,
+        default=1.0,
+        help="Per-point weight multiplier for extra vectors during MDS (default 1.0). "
+        "E.g. 5.0 makes extra vectors 5x more important in the stress optimization.",
+    )
 
     return parser
 
@@ -180,6 +187,7 @@ def main() -> None:
         mds_max_iter=getattr(args, "mds_max_iter", 300),
         mds_learning_rate=getattr(args, "mds_lr", 0.05),
         mds_tolerance=getattr(args, "mds_tol", 1e-7),
+        mds_extra_weight=getattr(args, "mds_extra_weight", 1.0),
         radius_scale=args.radius_scale,
         initial_zoom=args.initial_zoom,
         min_zoom=args.min_zoom,

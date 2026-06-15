@@ -41,6 +41,7 @@ class VisualizerConfig:
     min_zoom: float = -2.0
     max_zoom: float = 18.0
     apply_pca: bool = False
+    mds_extra_weight: float = 1.0
 
 
 def build_visualization(config: VisualizerConfig) -> Path:
@@ -51,7 +52,14 @@ def build_visualization(config: VisualizerConfig) -> Path:
             "Adjust --token-regex/--include or provide extra vectors."
         )
     vectors = np.asarray([record["vector"] for record in records], dtype=np.float32)
-    projected = reduce_embeddings(vectors, config)
+
+    point_weights = np.ones(len(records), dtype=np.float32)
+    if config.mds_extra_weight != 1.0:
+        for i, record in enumerate(records):
+            if record["source"].startswith("extra:"):
+                point_weights[i] = config.mds_extra_weight
+
+    projected = reduce_embeddings(vectors, config, point_weights)
     dataframe = build_dataframe(records, projected)
     figure = create_figure(dataframe, config)
     plotted_positions = np.asarray(dataframe["position"].tolist(), dtype=np.float32)
@@ -110,7 +118,13 @@ def load_embedding_records(config: VisualizerConfig) -> list[dict[str, Any]]:
     )
 
     if config.extra_vectors_path is not None:
-        records.extend(load_extra_vector_records(config, weights.shape[1]))
+        model_vecs = np.asarray(
+            [record["vector"] for record in records], dtype=np.float32
+        )
+        model_txts = [record["text"] for record in records]
+        records.extend(
+            load_extra_vector_records(config, weights.shape[1], model_vecs, model_txts)
+        )
 
     return records
 
@@ -188,7 +202,10 @@ def decode_token_text(tokenizer: Any, token_id: int) -> str:
 
 
 def load_extra_vector_records(
-    config: VisualizerConfig, expected_width: int
+    config: VisualizerConfig,
+    expected_width: int,
+    model_vectors: np.ndarray | None = None,
+    model_texts: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     if config.extra_vectors_path is None:
         return []
@@ -196,12 +213,8 @@ def load_extra_vector_records(
     payload = torch.load(
         config.extra_vectors_path, map_location=resolve_tensor_load_device(config)
     )
-    vectors, texts = parse_extra_payload(payload, config)
+    vectors, texts, source_key = parse_extra_payload(payload, config)
 
-    if vectors.ndim != 2:
-        raise ValueError(
-            f"Extra vectors must be a 2D tensor/array, received shape {tuple(vectors.shape)}."
-        )
     if vectors.shape[1] != expected_width:
         raise ValueError(
             "Extra vectors must have the same embedding width as the model input embeddings: "
@@ -212,9 +225,23 @@ def load_extra_vector_records(
             f"Extra vector labels count ({len(texts)}) does not match vector rows ({vectors.shape[0]})."
         )
 
+    if model_vectors is not None and model_texts is not None:
+        model_vectors_norm = model_vectors / np.linalg.norm(
+            model_vectors, axis=1, keepdims=True
+        ).clip(min=1e-12)
+    else:
+        model_vectors_norm = None
+
     records: list[dict[str, Any]] = []
     for index, text in enumerate(texts):
         label = str(text)
+        if model_vectors_norm is not None:
+            sims = model_vectors_norm @ (vectors[index] / max(np.linalg.norm(vectors[index]), 1e-12))
+            nearest_indices = np.argsort(-sims)[:3]
+            nearest_labels = [model_texts[i] for i in nearest_indices]
+            label = f"[{index}] {text}   ❮ {', '.join(nearest_labels)}"
+        else:
+            label = f"[{index}] {text}"
         records.append(
             {
                 "text": label,
@@ -222,6 +249,7 @@ def load_extra_vector_records(
                 "source": f"extra:{config.extra_vectors_path.name}",
                 "vector": vectors[index].astype(np.float32, copy=False),
                 "color": [245, 158, 11],
+                "weight": 5.0,
             }
         )
     return records
@@ -229,30 +257,64 @@ def load_extra_vector_records(
 
 def parse_extra_payload(
     payload: Any, config: VisualizerConfig
-) -> tuple[np.ndarray, list[str]]:
+) -> tuple[np.ndarray, list[str], str]:
+    """Returns (vectors, labels, source_key)."""
+    raw_vectors: Any = None
+    raw_labels: Any = None
+    source_key: str = ""
+
     if isinstance(payload, dict):
-        if config.extra_vectors_key not in payload:
-            raise ValueError(
-                f"Extra vector file is missing '{config.extra_vectors_key}' in its top-level dictionary."
-            )
-        if config.extra_labels_key not in payload:
-            raise ValueError(
-                f"Extra vector file is missing '{config.extra_labels_key}' in its top-level dictionary."
-            )
-        raw_vectors = payload[config.extra_vectors_key]
-        raw_labels = payload[config.extra_labels_key]
+        if config.extra_vectors_key in payload:
+            raw_vectors = payload[config.extra_vectors_key]
+            raw_labels = payload.get(config.extra_labels_key, None)
+            source_key = config.extra_vectors_key
+        else:
+            tensor_candidates = {
+                k: v
+                for k, v in payload.items()
+                if isinstance(v, (torch.Tensor, np.ndarray))
+            }
+            if not tensor_candidates:
+                raise ValueError(
+                    f"Extra vector file is missing '{config.extra_vectors_key}' "
+                    f"and no tensor values found. Available keys: {list(payload.keys())}"
+                )
+            best_key = list(tensor_candidates.keys())[0]
+            raw_vectors = tensor_candidates[best_key]
+            source_key = best_key
     elif isinstance(payload, torch.Tensor):
         raw_vectors = payload
-        raw_labels = [f"extra_{index}" for index in range(payload.shape[0])]
+        source_key = "tensor"
     else:
         raise ValueError(
-            "Unsupported extra vector payload. Expected either a tensor or a dictionary with "
-            f"'{config.extra_vectors_key}' and '{config.extra_labels_key}'."
+            "Unsupported extra vector payload. Expected either a tensor or a dictionary."
         )
 
+    if hasattr(raw_vectors, "ndim") and raw_vectors.ndim == 3:
+        if raw_vectors.shape[0] == 1:
+            raw_vectors = raw_vectors.squeeze(0)
+        elif raw_vectors.shape[1] == 1:
+            raw_vectors = raw_vectors.squeeze(1)
+        else:
+            raise ValueError(
+                f"Extra vectors have 3 dimensions {tuple(raw_vectors.shape)}. "
+                "Cannot auto-squeeze; expected shape (N, D) or (1, N, D)."
+            )
+
     vectors = to_numpy_matrix(raw_vectors)
-    labels = [str(item) for item in raw_labels]
-    return vectors, labels
+
+    if vectors.ndim != 2:
+        raise ValueError(
+            f"Extra vectors must be a 2D tensor/array, received shape {tuple(vectors.shape)}."
+        )
+
+    if raw_labels is not None:
+        raw_labels_list = list(raw_labels)
+    else:
+        raw_labels_list = [f"{source_key}[{i}]" for i in range(vectors.shape[0])]
+
+    labels = [str(item) for item in raw_labels_list]
+    return vectors, labels, source_key
 
 
 def to_numpy_matrix(raw_vectors: Any) -> np.ndarray:
@@ -263,12 +325,14 @@ def to_numpy_matrix(raw_vectors: Any) -> np.ndarray:
     return np.asarray(raw_vectors, dtype=np.float32)
 
 
-def reduce_embeddings(vectors: np.ndarray, config: VisualizerConfig) -> np.ndarray:
+def reduce_embeddings(
+    vectors: np.ndarray, config: VisualizerConfig, point_weights: np.ndarray | None = None
+) -> np.ndarray:
     processed = maybe_apply_pca(vectors, config)
     if config.reduction_method == "umap":
         return reduce_with_umap(processed, config)
     if config.reduction_method == "mds":
-        return reduce_with_mds(processed, config)
+        return reduce_with_mds(processed, config, point_weights)
     raise ValueError(f"Unsupported reduction method: {config.reduction_method}")
 
 
@@ -284,7 +348,11 @@ def reduce_with_umap(vectors: np.ndarray, config: VisualizerConfig) -> np.ndarra
     return np.asarray(reduced, dtype=np.float32)
 
 
-def reduce_with_mds(vectors: np.ndarray, config: VisualizerConfig) -> np.ndarray:
+def reduce_with_mds(
+    vectors: np.ndarray,
+    config: VisualizerConfig,
+    point_weights: np.ndarray | None = None,
+) -> np.ndarray:
     mds_module = importlib.import_module("embedding_vis.mds")
     return mds_module.reduce_with_mds(
         vectors,
@@ -295,6 +363,7 @@ def reduce_with_mds(vectors: np.ndarray, config: VisualizerConfig) -> np.ndarray
         max_iter=config.mds_max_iter,
         learning_rate=config.mds_learning_rate,
         tolerance=config.mds_tolerance,
+        point_weights=point_weights,
     )
 
 
@@ -319,6 +388,8 @@ def build_dataframe(
     safe_scale = max(max_abs, 1e-6)
     positions = projected / safe_scale
     radii = infer_point_radii(positions)
+    for i, record in enumerate(records):
+        radii[i] *= record.get("weight", 1.0)
     dataframe = pd.DataFrame(
         {
             "point_id": list(range(len(records))),

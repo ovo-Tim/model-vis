@@ -14,6 +14,7 @@ def reduce_with_mds(
     max_iter: int,
     learning_rate: float,
     tolerance: float,
+    point_weights: np.ndarray | None = None,
 ) -> np.ndarray:
     device = resolve_mds_device(device_preference)
     try:
@@ -26,6 +27,7 @@ def reduce_with_mds(
             max_iter=max_iter,
             learning_rate=learning_rate,
             tolerance=tolerance,
+            point_weights=point_weights,
         )
     except (RuntimeError, NotImplementedError) as error:
         if device_preference == "auto" and device.type != "cpu":
@@ -39,6 +41,7 @@ def reduce_with_mds(
                 max_iter=max_iter,
                 learning_rate=learning_rate,
                 tolerance=tolerance,
+                point_weights=point_weights,
             )
             device = torch.device("cpu")
         else:
@@ -58,6 +61,7 @@ def metric_mds_torch(
     max_iter: int,
     learning_rate: float,
     tolerance: float,
+    point_weights: np.ndarray | None = None,
 ) -> np.ndarray:
     points = torch.as_tensor(vectors, dtype=resolve_mds_dtype(device), device=device)
     if points.ndim != 2:
@@ -75,6 +79,13 @@ def metric_mds_torch(
     target = compute_pairwise_dissimilarities_condensed(
         points, metric, upper_i, upper_j
     )
+
+    pair_weights: torch.Tensor | None = None
+    if point_weights is not None:
+        w = torch.as_tensor(
+            point_weights, dtype=points.dtype, device=device
+        )
+        pair_weights = torch.sqrt(w[upper_i] * w[upper_j])
 
     generator = torch.Generator(device=device)
     generator.manual_seed(random_seed)
@@ -94,7 +105,10 @@ def metric_mds_torch(
         projected_distances = torch.cdist(embedding, embedding, p=2.0)
         projected = projected_distances[upper_i, upper_j]
         difference = projected - target
-        loss = torch.mean(difference.square())
+        squared = difference.square()
+        if pair_weights is not None:
+            squared = squared * pair_weights
+        loss = torch.mean(squared)
         loss.backward()
         optimizer.step()
 
