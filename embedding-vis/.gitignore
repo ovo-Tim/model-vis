@@ -1,0 +1,5 @@
+*.html
+!example_*.html
+
+.vscode
+*.pt
