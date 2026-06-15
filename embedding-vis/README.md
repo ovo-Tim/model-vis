@@ -117,12 +117,12 @@ Filtering is entirely client-side, so it works directly from the saved HTML file
 ```bash
 uv run embedding-vis mds --model Qwen/Qwen3.5-2B --max-points 6000 --dimensions 2 --output sample_embedding_vis_mds.html --mds-max-iter 3000 --sampling-mode random --seed 114514 --mds-lr 0.1
 ```
-See `example_qwen_dms.html`.
+See `examples/example_qwen_dms.html`.
 ![alt text](./imgs/dms.png)
 
 ```bash
 uv run embedding-vis umap --model Qwen/Qwen3.5-2B --max-points 6000 --dimensions 2 --output sample_embedding_vis_mds.html --sampling-mode random --seed 114514
 ```
-See `example_qwen_umap.html`.
+See `examples/example_qwen_umap.html`.
 ![alt text](./imgs/umap.png)
 ![alt text](./imgs/umap2.png)
